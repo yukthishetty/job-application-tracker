@@ -1,10 +1,9 @@
 import os
 import uuid
-import secrets
-import smtplib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 from fastapi import (
@@ -13,11 +12,11 @@ from fastapi import (
     HTTPException,
     UploadFile,
     File,
-    Form,
+    Header,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from jose import jwt, JWTError
+from jose import JWTError, jwt
 from pwdlib import PasswordHash
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import (
@@ -32,17 +31,17 @@ from sqlalchemy import (
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
+    Session,
     mapped_column,
     relationship,
     sessionmaker,
-    Session,
 )
 
-load_dotenv()
-
-# ---------------------------------------------------------
+# =========================================================
 # CONFIGURATION
-# ---------------------------------------------------------
+# =========================================================
+
+load_dotenv()
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -66,16 +65,19 @@ FRONTEND_URL = os.getenv(
 )
 
 UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------
+
+# =========================================================
 # DATABASE
-# ---------------------------------------------------------
+# =========================================================
 
 connect_args = {}
 
 if DATABASE_URL.startswith("sqlite"):
-    connect_args = {"check_same_thread": False}
+    connect_args = {
+        "check_same_thread": False
+    }
 
 engine = create_engine(
     DATABASE_URL,
@@ -93,9 +95,9 @@ class Base(DeclarativeBase):
     pass
 
 
-# ---------------------------------------------------------
+# =========================================================
 # DATABASE MODELS
-# ---------------------------------------------------------
+# =========================================================
 
 class User(Base):
     __tablename__ = "users"
@@ -147,6 +149,41 @@ class User(Base):
     )
 
 
+class Resume(Base):
+    __tablename__ = "resumes"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+
+    filename: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    stored_filename: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+    )
+
+    user = relationship(
+        "User",
+        back_populates="resumes",
+    )
+
+
 class Application(Base):
     __tablename__ = "applications"
 
@@ -189,6 +226,7 @@ class Application(Base):
     status: Mapped[str] = mapped_column(
         String(50),
         default="Applied",
+        nullable=False,
     )
 
     application_date: Mapped[datetime] = mapped_column(
@@ -270,6 +308,7 @@ class Interview(Base):
     interview_type: Mapped[str] = mapped_column(
         String(100),
         default="Technical",
+        nullable=False,
     )
 
     scheduled_at: Mapped[datetime] = mapped_column(
@@ -293,52 +332,17 @@ class Interview(Base):
     )
 
 
-class Resume(Base):
-    __tablename__ = "resumes"
-
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        index=True,
-    )
-
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id"),
-        nullable=False,
-    )
-
-    filename: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-    )
-
-    stored_filename: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-    )
-
-    user = relationship(
-        "User",
-        back_populates="resumes",
-    )
-
-
 Base.metadata.create_all(bind=engine)
 
 
-# ---------------------------------------------------------
-# FASTAPI
-# ---------------------------------------------------------
+# =========================================================
+# FASTAPI APPLICATION
+# =========================================================
 
 app = FastAPI(
     title="Job Application Tracker API",
     description=(
-        "Full-stack job and internship application management API."
+        "Backend API for managing job and internship applications."
     ),
     version="1.0.0",
 )
@@ -356,9 +360,9 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # DATABASE DEPENDENCY
-# ---------------------------------------------------------
+# =========================================================
 
 def get_db():
     db = SessionLocal()
@@ -369,16 +373,19 @@ def get_db():
         db.close()
 
 
-# ---------------------------------------------------------
-# PASSWORD + JWT
-# ---------------------------------------------------------
+# =========================================================
+# AUTHENTICATION
+# =========================================================
 
 password_hash = PasswordHash.recommended()
 
 
 def create_access_token(user_id: int) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(
-        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    expire = (
+        datetime.now(timezone.utc)
+        + timedelta(
+            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+        )
     )
 
     payload = {
@@ -393,36 +400,32 @@ def create_access_token(user_id: int) -> str:
     )
 
 
-def get_current_user(
-    authorization: Optional[str] = None,
-    db: Session = Depends(get_db),
-):
-    from fastapi import Header
-
-    # This function is replaced below by get_authenticated_user.
-    raise HTTPException(
-        status_code=401,
-        detail="Authentication required",
-    )
-
-
 def get_authenticated_user(
-    authorization: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
     if not authorization:
         raise HTTPException(
             status_code=401,
-            detail="Authorization header required",
+            detail="Authorization header required.",
         )
 
     if not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
-            detail="Invalid authorization format",
+            detail="Invalid authorization format.",
         )
 
-    token = authorization.split(" ", 1)[1]
+    token = authorization.split(
+        " ",
+        1,
+    )[1].strip()
+
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authorization token.",
+        )
 
     try:
         payload = jwt.decode(
@@ -436,29 +439,38 @@ def get_authenticated_user(
         if not user_id:
             raise HTTPException(
                 status_code=401,
-                detail="Invalid token",
+                detail="Invalid token.",
             )
 
-        user = db.get(User, int(user_id))
+        user = db.get(
+            User,
+            int(user_id),
+        )
 
         if not user:
             raise HTTPException(
                 status_code=401,
-                detail="User not found",
+                detail="User not found.",
             )
 
         return user
 
-    except (JWTError, ValueError):
+    except JWTError:
         raise HTTPException(
             status_code=401,
-            detail="Invalid or expired token",
+            detail="Invalid or expired token.",
+        )
+
+    except ValueError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token.",
         )
 
 
-# ---------------------------------------------------------
-# SCHEMAS
-# ---------------------------------------------------------
+# =========================================================
+# REQUEST SCHEMAS
+# =========================================================
 
 class SignupRequest(BaseModel):
     name: str
@@ -496,15 +508,16 @@ class InterviewRequest(BaseModel):
     application_id: Optional[int] = None
 
 
-# ---------------------------------------------------------
+# =========================================================
 # BASIC ROUTES
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get("/")
 def root():
     return {
         "message": "Job Application Tracker API is running!",
         "status": "success",
+        "version": "1.0.0",
     }
 
 
@@ -516,18 +529,20 @@ def health_check():
     }
 
 
-# ---------------------------------------------------------
-# AUTHENTICATION
-# ---------------------------------------------------------
+# =========================================================
+# SIGNUP
+# =========================================================
 
 @app.post("/auth/signup")
 def signup(
     data: SignupRequest,
     db: Session = Depends(get_db),
 ):
+    email = data.email.lower().strip()
+
     existing_user = (
         db.query(User)
-        .filter(User.email == data.email.lower())
+        .filter(User.email == email)
         .first()
     )
 
@@ -537,6 +552,12 @@ def signup(
             detail="An account with this email already exists.",
         )
 
+    if len(data.name.strip()) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter a valid name.",
+        )
+
     if len(data.password) < 6:
         raise HTTPException(
             status_code=400,
@@ -544,19 +565,23 @@ def signup(
         )
 
     user = User(
-        name=data.name,
-        email=data.email.lower(),
-        password_hash=password_hash.hash(data.password),
+        name=data.name.strip(),
+        email=email,
+        password_hash=password_hash.hash(
+            data.password
+        ),
     )
 
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    token = create_access_token(user.id)
+    token = create_access_token(
+        user.id
+    )
 
     return {
-        "message": "Account created successfully",
+        "message": "Account created successfully.",
         "access_token": token,
         "token_type": "bearer",
         "user": {
@@ -567,14 +592,20 @@ def signup(
     }
 
 
+# =========================================================
+# LOGIN
+# =========================================================
+
 @app.post("/auth/login")
 def login(
     data: LoginRequest,
     db: Session = Depends(get_db),
 ):
+    email = data.email.lower().strip()
+
     user = (
         db.query(User)
-        .filter(User.email == data.email.lower())
+        .filter(User.email == email)
         .first()
     )
 
@@ -584,16 +615,23 @@ def login(
             detail="Incorrect email or password.",
         )
 
-    if not password_hash.verify(
-        data.password,
-        user.password_hash,
-    ):
+    try:
+        valid_password = password_hash.verify(
+            data.password,
+            user.password_hash,
+        )
+    except Exception:
+        valid_password = False
+
+    if not valid_password:
         raise HTTPException(
             status_code=401,
             detail="Incorrect email or password.",
         )
 
-    token = create_access_token(user.id)
+    token = create_access_token(
+        user.id
+    )
 
     return {
         "access_token": token,
@@ -606,16 +644,16 @@ def login(
     }
 
 
+# =========================================================
+# CURRENT USER
+# =========================================================
+
 @app.get("/me")
 def get_me(
-    authorization: Optional[str] = None,
-    db: Session = Depends(get_db),
+    user: User = Depends(
+        get_authenticated_user
+    ),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     return {
         "id": user.id,
         "name": user.name,
@@ -623,31 +661,72 @@ def get_me(
     }
 
 
-# ---------------------------------------------------------
-# APPLICATIONS
-# ---------------------------------------------------------
+# =========================================================
+# APPLICATION HELPER
+# =========================================================
+
+def application_to_dict(
+    application: Application,
+):
+    return {
+        "id": application.id,
+        "company": application.company,
+        "role": application.role,
+        "location": application.location,
+        "job_type": application.job_type,
+        "salary": application.salary,
+        "status": application.status,
+        "application_date": application.application_date,
+        "deadline": application.deadline,
+        "follow_up_date": application.follow_up_date,
+        "resume_id": application.resume_id,
+        "job_description": application.job_description,
+        "notes": application.notes,
+        "created_at": application.created_at,
+        "updated_at": application.updated_at,
+    }
+
+
+# =========================================================
+# CREATE APPLICATION
+# =========================================================
 
 @app.post("/applications")
 def create_application(
     data: ApplicationRequest,
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
+    if data.resume_id:
+        resume = (
+            db.query(Resume)
+            .filter(
+                Resume.id == data.resume_id,
+                Resume.user_id == user.id,
+            )
+            .first()
+        )
+
+        if not resume:
+            raise HTTPException(
+                status_code=404,
+                detail="Selected resume was not found.",
+            )
 
     application = Application(
         user_id=user.id,
-        company=data.company,
-        role=data.role,
+        company=data.company.strip(),
+        role=data.role.strip(),
         location=data.location,
         job_type=data.job_type,
         salary=data.salary,
         status=data.status,
-        application_date=data.application_date
-        or datetime.utcnow(),
+        application_date=(
+            data.application_date
+            or datetime.utcnow()
+        ),
         deadline=data.deadline,
         follow_up_date=data.follow_up_date,
         resume_id=data.resume_id,
@@ -659,32 +738,40 @@ def create_application(
     db.commit()
     db.refresh(application)
 
-    return application_to_dict(application)
+    return application_to_dict(
+        application
+    )
 
+
+# =========================================================
+# GET APPLICATIONS
+# =========================================================
 
 @app.get("/applications")
 def get_applications(
     search: Optional[str] = None,
     status: Optional[str] = None,
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     query = (
         db.query(Application)
-        .filter(Application.user_id == user.id)
+        .filter(
+            Application.user_id == user.id
+        )
     )
 
     if search:
-        search_text = f"%{search}%"
+        search_text = f"%{search.strip()}%"
 
         query = query.filter(
             (Application.company.ilike(search_text))
-            | (Application.role.ilike(search_text))
+            |
+            (Application.role.ilike(search_text))
+            |
+            (Application.location.ilike(search_text))
         )
 
     if status:
@@ -694,7 +781,9 @@ def get_applications(
 
     applications = (
         query
-        .order_by(Application.created_at.desc())
+        .order_by(
+            Application.created_at.desc()
+        )
         .all()
     )
 
@@ -704,18 +793,19 @@ def get_applications(
     ]
 
 
+# =========================================================
+# UPDATE APPLICATION
+# =========================================================
+
 @app.put("/applications/{application_id}")
 def update_application(
     application_id: int,
     data: ApplicationRequest,
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     application = (
         db.query(Application)
         .filter(
@@ -731,8 +821,24 @@ def update_application(
             detail="Application not found.",
         )
 
-    application.company = data.company
-    application.role = data.role
+    if data.resume_id:
+        resume = (
+            db.query(Resume)
+            .filter(
+                Resume.id == data.resume_id,
+                Resume.user_id == user.id,
+            )
+            .first()
+        )
+
+        if not resume:
+            raise HTTPException(
+                status_code=404,
+                detail="Selected resume was not found.",
+            )
+
+    application.company = data.company.strip()
+    application.role = data.role.strip()
     application.location = data.location
     application.job_type = data.job_type
     application.salary = data.salary
@@ -750,20 +856,23 @@ def update_application(
     db.commit()
     db.refresh(application)
 
-    return application_to_dict(application)
+    return application_to_dict(
+        application
+    )
 
+
+# =========================================================
+# DELETE APPLICATION
+# =========================================================
 
 @app.delete("/applications/{application_id}")
 def delete_application(
     application_id: int,
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     application = (
         db.query(Application)
         .filter(
@@ -787,44 +896,58 @@ def delete_application(
     }
 
 
-def application_to_dict(application):
+# =========================================================
+# INTERVIEW HELPER
+# =========================================================
+
+def interview_to_dict(
+    interview: Interview,
+):
     return {
-        "id": application.id,
-        "company": application.company,
-        "role": application.role,
-        "location": application.location,
-        "job_type": application.job_type,
-        "salary": application.salary,
-        "status": application.status,
-        "application_date": application.application_date,
-        "deadline": application.deadline,
-        "follow_up_date": application.follow_up_date,
-        "resume_id": application.resume_id,
-        "job_description": application.job_description,
-        "notes": application.notes,
+        "id": interview.id,
+        "company": interview.company,
+        "role": interview.role,
+        "interview_type": interview.interview_type,
+        "scheduled_at": interview.scheduled_at,
+        "meeting_link": interview.meeting_link,
+        "notes": interview.notes,
+        "application_id": interview.application_id,
     }
 
 
-# ---------------------------------------------------------
-# INTERVIEWS
-# ---------------------------------------------------------
+# =========================================================
+# CREATE INTERVIEW
+# =========================================================
 
 @app.post("/interviews")
 def create_interview(
     data: InterviewRequest,
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
+    if data.application_id:
+        application = (
+            db.query(Application)
+            .filter(
+                Application.id == data.application_id,
+                Application.user_id == user.id,
+            )
+            .first()
+        )
+
+        if not application:
+            raise HTTPException(
+                status_code=404,
+                detail="Application not found.",
+            )
 
     interview = Interview(
         user_id=user.id,
         application_id=data.application_id,
-        company=data.company,
-        role=data.role,
+        company=data.company.strip(),
+        role=data.role.strip(),
         interview_type=data.interview_type,
         scheduled_at=data.scheduled_at,
         meeting_link=data.meeting_link,
@@ -835,23 +958,30 @@ def create_interview(
     db.commit()
     db.refresh(interview)
 
-    return interview_to_dict(interview)
+    return interview_to_dict(
+        interview
+    )
 
+
+# =========================================================
+# GET INTERVIEWS
+# =========================================================
 
 @app.get("/interviews")
 def get_interviews(
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     interviews = (
         db.query(Interview)
-        .filter(Interview.user_id == user.id)
-        .order_by(Interview.scheduled_at.asc())
+        .filter(
+            Interview.user_id == user.id
+        )
+        .order_by(
+            Interview.scheduled_at.asc()
+        )
         .all()
     )
 
@@ -861,17 +991,18 @@ def get_interviews(
     ]
 
 
+# =========================================================
+# DELETE INTERVIEW
+# =========================================================
+
 @app.delete("/interviews/{interview_id}")
 def delete_interview(
     interview_id: int,
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     interview = (
         db.query(Interview)
         .filter(
@@ -895,33 +1026,23 @@ def delete_interview(
     }
 
 
-def interview_to_dict(interview):
-    return {
-        "id": interview.id,
-        "company": interview.company,
-        "role": interview.role,
-        "interview_type": interview.interview_type,
-        "scheduled_at": interview.scheduled_at,
-        "meeting_link": interview.meeting_link,
-        "notes": interview.notes,
-        "application_id": interview.application_id,
-    }
-
-
-# ---------------------------------------------------------
-# RESUME MANAGEMENT
-# ---------------------------------------------------------
+# =========================================================
+# RESUME UPLOAD
+# =========================================================
 
 @app.post("/resumes")
 async def upload_resume(
     file: UploadFile = File(...),
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Please select a file.",
+        )
 
     allowed_extensions = {
         ".pdf",
@@ -929,7 +1050,9 @@ async def upload_resume(
         ".docx",
     }
 
-    extension = Path(file.filename).suffix.lower()
+    extension = Path(
+        file.filename
+    ).suffix.lower()
 
     if extension not in allowed_extensions:
         raise HTTPException(
@@ -939,7 +1062,9 @@ async def upload_resume(
 
     content = await file.read()
 
-    if len(content) > 10 * 1024 * 1024:
+    max_size = 10 * 1024 * 1024
+
+    if len(content) > max_size:
         raise HTTPException(
             status_code=400,
             detail="Resume must be smaller than 10 MB.",
@@ -949,9 +1074,14 @@ async def upload_resume(
         f"{uuid.uuid4().hex}{extension}"
     )
 
-    file_path = UPLOAD_DIR / stored_filename
+    file_path = (
+        UPLOAD_DIR / stored_filename
+    )
 
-    with open(file_path, "wb") as output:
+    with open(
+        file_path,
+        "wb",
+    ) as output:
         output.write(content)
 
     resume = Resume(
@@ -971,20 +1101,25 @@ async def upload_resume(
     }
 
 
+# =========================================================
+# GET RESUMES
+# =========================================================
+
 @app.get("/resumes")
 def get_resumes(
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     resumes = (
         db.query(Resume)
-        .filter(Resume.user_id == user.id)
-        .order_by(Resume.created_at.desc())
+        .filter(
+            Resume.user_id == user.id
+        )
+        .order_by(
+            Resume.created_at.desc()
+        )
         .all()
     )
 
@@ -998,17 +1133,18 @@ def get_resumes(
     ]
 
 
+# =========================================================
+# DOWNLOAD RESUME
+# =========================================================
+
 @app.get("/resumes/{resume_id}/download")
 def download_resume(
     resume_id: int,
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     resume = (
         db.query(Resume)
         .filter(
@@ -1024,7 +1160,10 @@ def download_resume(
             detail="Resume not found.",
         )
 
-    file_path = UPLOAD_DIR / resume.stored_filename
+    file_path = (
+        UPLOAD_DIR
+        / resume.stored_filename
+    )
 
     if not file_path.exists():
         raise HTTPException(
@@ -1038,29 +1177,30 @@ def download_resume(
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # ANALYTICS
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get("/analytics")
 def analytics(
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     applications = (
         db.query(Application)
-        .filter(Application.user_id == user.id)
+        .filter(
+            Application.user_id == user.id
+        )
         .all()
     )
 
     interviews = (
         db.query(Interview)
-        .filter(Interview.user_id == user.id)
+        .filter(
+            Interview.user_id == user.id
+        )
         .all()
     )
 
@@ -1069,24 +1209,42 @@ def analytics(
     status_counts = {}
 
     for application in applications:
-        status_counts[application.status] = (
-            status_counts.get(application.status, 0) + 1
+        status_counts[
+            application.status
+        ] = (
+            status_counts.get(
+                application.status,
+                0,
+            )
+            + 1
         )
 
-    selected = status_counts.get("Selected", 0)
+    selected = status_counts.get(
+        "Selected",
+        0,
+    )
 
-    rejected = status_counts.get("Rejected", 0)
+    rejected = status_counts.get(
+        "Rejected",
+        0,
+    )
 
     interview_count = len(interviews)
 
     offer_rate = (
-        round((selected / total) * 100, 2)
+        round(
+            selected / total * 100,
+            2,
+        )
         if total
         else 0
     )
 
     rejection_rate = (
-        round((rejected / total) * 100, 2)
+        round(
+            rejected / total * 100,
+            2,
+        )
         if total
         else 0
     )
@@ -1102,21 +1260,20 @@ def analytics(
     }
 
 
-# ---------------------------------------------------------
+# =========================================================
 # GOOGLE CALENDAR
-# ---------------------------------------------------------
+# =========================================================
 
-@app.get("/google-calendar-url/{interview_id}")
+@app.get(
+    "/google-calendar-url/{interview_id}"
+)
 def google_calendar_url(
     interview_id: int,
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     interview = (
         db.query(Interview)
         .filter(
@@ -1133,7 +1290,10 @@ def google_calendar_url(
         )
 
     start = interview.scheduled_at
-    end = start + timedelta(hours=1)
+
+    end = start + timedelta(
+        hours=1
+    )
 
     start_string = start.strftime(
         "%Y%m%dT%H%M%SZ"
@@ -1143,42 +1303,46 @@ def google_calendar_url(
         "%Y%m%dT%H%M%SZ"
     )
 
-    from urllib.parse import urlencode
-
     params = {
         "action": "TEMPLATE",
-        "text": f"{interview.company} - {interview.role}",
-        "dates": f"{start_string}/{end_string}",
-        "details": interview.notes or "",
+        "text": (
+            f"{interview.company} - "
+            f"{interview.role}"
+        ),
+        "dates": (
+            f"{start_string}/{end_string}"
+        ),
+        "details": (
+            interview.notes or ""
+        ),
     }
 
-    url = (
+    calendar_url = (
         "https://calendar.google.com/calendar/render?"
         + urlencode(params)
     )
 
     return {
-        "url": url
+        "url": calendar_url
     }
 
 
-# ---------------------------------------------------------
+# =========================================================
 # SMART INSIGHTS
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get("/insights")
 def insights(
-    authorization: Optional[str] = None,
+    user: User = Depends(
+        get_authenticated_user
+    ),
     db: Session = Depends(get_db),
 ):
-    user = get_authenticated_user(
-        authorization,
-        db,
-    )
-
     applications = (
         db.query(Application)
-        .filter(Application.user_id == user.id)
+        .filter(
+            Application.user_id == user.id
+        )
         .all()
     )
 
@@ -1203,50 +1367,59 @@ def insights(
         if application.status == "Selected"
     )
 
+    rejected = sum(
+        1
+        for application in applications
+        if application.status == "Rejected"
+    )
+
     followups = sum(
         1
         for application in applications
         if application.follow_up_date
     )
 
-    result = []
+    insights_list = []
 
-    if total >= 5:
-        result.append(
-            f"You have tracked {total} applications."
-        )
+    insights_list.append(
+        f"You have tracked {total} application(s)."
+    )
 
     if interviews:
-        result.append(
-            f"{interviews} applications have reached the interview stage."
+        insights_list.append(
+            f"{interviews} application(s) have reached the interview stage."
         )
 
     if selected:
-        result.append(
+        insights_list.append(
             f"You currently have {selected} selected application(s)."
         )
 
+    if rejected:
+        insights_list.append(
+            f"{rejected} application(s) are marked as rejected."
+        )
+
     if followups:
-        result.append(
+        insights_list.append(
             f"{followups} application(s) have follow-up dates."
         )
 
-    applied_count = sum(
-        1
-        for application in applications
-        if application.status == "Applied"
-    )
-
-    if applied_count >= 5:
-        result.append(
-            "Consider following up on older applications."
+    if total >= 5 and interviews == 0:
+        insights_list.append(
+            "Consider reviewing your resume and application targeting because none of the tracked applications have reached the interview stage yet."
         )
 
-    if not result:
-        result.append(
-            "Keep your application information updated to generate more insights."
+    if total >= 5 and interviews > 0:
+        interview_rate = round(
+            interviews / total * 100,
+            2,
+        )
+
+        insights_list.append(
+            f"Your current application-to-interview rate is {interview_rate}%."
         )
 
     return {
-        "insights": result
+        "insights": insights_list
     }
